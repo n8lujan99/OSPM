@@ -1,0 +1,2 @@
+# Preserve historical Fortran reference formatting.
+OSPM/Fortran/*.txt whitespace=-trailing-space

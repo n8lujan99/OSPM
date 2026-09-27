@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use OSPM in scientific work, please cite this software and the associated scientific publications."
+title: "OSPM: Orbit Superposition Modeling"
+version: 3.0.0
+date-released: 2026-09-27
+authors:
+  - family-names: Lujan
+    given-names: Nathaniel R.
+license: MIT
+repository-code: "https://github.com/n8lujan99/OSPM"

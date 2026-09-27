@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ------------------------------------------------------------
+# Cluster / Julia setup
+# ------------------------------------------------------------
+export JULIA_DEPOT_PATH="${JULIA_DEPOT_PATH:-$HOME/.julia}"
+export JULIA_PKG_SERVER=""
+
+# ------------------------------------------------------------
+# Resolve repo paths
+# ------------------------------------------------------------
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WHICH_GAL_FILE="$REPO_ROOT/which_galaxy"
+
+GALAXY_PROFILE_DIR="$REPO_ROOT/Data/Galaxy_Profiles"
+SLURM_SCRIPT="$REPO_ROOT/Data/slurm"
+
+# ---- Basic repo sanity check ----
+if [[ ! -d "$REPO_ROOT" ]]; then
+    echo "[FATAL] Could not determine repo root"
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Read selected galaxy
+# ------------------------------------------------------------
+if [[ ! -f "$WHICH_GAL_FILE" ]]; then
+    echo "[FATAL] which_galaxy file not found at:"
+    echo "        $WHICH_GAL_FILE"
+    exit 1
+fi
+
+GALAXY="$(tr -d '[:space:]' < "$WHICH_GAL_FILE")"
+
+if [[ -z "$GALAXY" ]]; then
+    echo "[FATAL] which_galaxy is empty"
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Sanity checks
+# ------------------------------------------------------------
+if [[ ! -d "$GALAXY_PROFILE_DIR" ]]; then
+    echo "[FATAL] Galaxy profile directory not found:"
+    echo "        $GALAXY_PROFILE_DIR"
+    exit 1
+fi
+
+if [[ ! -d "$GALAXY_PROFILE_DIR/$GALAXY" ]]; then
+    echo "[FATAL] Galaxy profile not found:"
+    echo "        $GALAXY_PROFILE_DIR/$GALAXY"
+    echo
+    echo "[INFO] Available galaxies:"
+    ls -1 "$GALAXY_PROFILE_DIR" || true
+    exit 1
+fi
+
+if [[ ! -f "$SLURM_SCRIPT" ]]; then
+    echo "[FATAL] Slurm script not found at:"
+    echo "        $SLURM_SCRIPT"
+    exit 1
+fi
+
+mkdir -p "$REPO_ROOT/logs"
+
+# ------------------------------------------------------------
+# Submit
+# ------------------------------------------------------------
+echo "[INFO] Submitting OSPM v3 job"
+echo "[INFO] Repo root:        $REPO_ROOT"
+echo "[INFO] Galaxy:           $GALAXY"
+echo "[INFO] Profiles:         $GALAXY_PROFILE_DIR"
+echo "[INFO] Slurm:            $SLURM_SCRIPT"
+echo "[INFO] Julia depot path: $JULIA_DEPOT_PATH"
+echo "[NOTE] Wait 1 min before submitting additional runs"
+
+sbatch \
+    --export=ALL,OSPM_REPO_ROOT="$REPO_ROOT",OSPM_GALAXY="$GALAXY",OSPM_VERSION="V3" \
+    "$SLURM_SCRIPT"

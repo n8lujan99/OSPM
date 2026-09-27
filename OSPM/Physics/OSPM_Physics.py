@@ -1,0 +1,789 @@
+# OSPM/Physics/OSPM_Physics.py
+# Python-to-Julia physics bridge
+# Python owns contracts, config plumbing, and conversion.
+# Julia owns orbit integration, binned LOSVD/light A-matrix construction, weights,
+# hard light constraints, and the raw LOSVD chi2 score.
+import os
+import sys
+import numpy as np
+from OSPM.AI.OSPM_Smart_Run import detect_available_cpus, plan_shared_pool, plan_smart_run
+# --- PythonCall / JuliaCall must see these BEFORE importing juliacall ---
+os.environ["PYTHON"] = sys.executable
+# repo root owns Project.toml / Manifest.toml
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# ---- Force JuliaCall to use repo project deterministically ----
+os.environ.setdefault("PYTHON_JULIACALL_PROJECT", _REPO_ROOT)
+os.environ.setdefault("PYTHON_JULIACALL_EXE", os.path.expanduser("~/.juliaup/bin/julia"))
+# ---- Embedded stability ----
+os.environ.setdefault("PYTHON_JULIACALL_HANDLE_SIGNALS", "yes")
+USE_JULIA = os.environ.get("OSPM_USE_JULIA", "0").strip().lower() in ("1", "true", "yes")
+_JL_READY = False
+_Main = None
+print("[PY] OSPM_Physics OSPM bridge imported from:", __file__)
+
+pc = 3.085677581e16
+kms = 1.0e3
+Msun = 1.98847e30
+G = 6.67430e-11
+c = 2.99792458e8
+
+_NFW_VCIRC_DENOM = 4.0 * np.pi * G * (np.log(2.0) - 0.5)
+
+def _runtime_shared_pool_plan(*, preferred_threads_per_model, min_cpus_per_model=5, max_cpus_per_model=20, requested_model_owner_limit=0, julia_threads=None):
+    requested_model_owner_limit = int(requested_model_owner_limit)
+    if requested_model_owner_limit < 0:
+        raise ValueError("MODEL_OWNER_LIMIT must be >= 0; use 0 for automatic Smart Run scheduling")
+    snapshot = detect_available_cpus(julia_threads=julia_threads)
+    allocation = plan_smart_run(
+        snapshot,
+        preferred_cpus_per_model=int(preferred_threads_per_model),
+        min_cpus_per_model=int(min_cpus_per_model),
+        max_cpus_per_model=int(max_cpus_per_model),
+        max_model_owners=requested_model_owner_limit if requested_model_owner_limit > 0 else None,
+    )
+    return plan_shared_pool(allocation), snapshot
+
+def _jl_init(*, assigned_cpus=None, threads_per_model=8, shared_pool=False):
+    global _JL_READY, _Main
+    if assigned_cpus is None:
+        assigned_cpus = detect_available_cpus().available_cpus
+    assigned_cpus = int(assigned_cpus)
+    threads_per_model = int(threads_per_model)
+    if assigned_cpus <= 0:
+        raise ValueError("assigned_cpus must be positive")
+    if threads_per_model <= 0:
+        raise ValueError("threads_per_model must be positive")
+    blas_threads = 1 if shared_pool else min(threads_per_model, assigned_cpus)
+    if _JL_READY:
+        _Main.seval(f"LinearAlgebra.BLAS.set_num_threads({blas_threads})")
+        return
+    if not USE_JULIA:
+        raise RuntimeError("OSPM_USE_JULIA is not enabled")
+    if "torch" in sys.modules:
+        print("[WARN] torch imported before juliacall. This can be unstable on some systems.")
+    os.environ.setdefault("JULIA_PROJECT", _REPO_ROOT)
+    os.environ.setdefault("JULIA_NUM_THREADS", str(assigned_cpus))
+    os.environ.setdefault("PYTHON_JULIACALL_THREADS", str(assigned_cpus))
+    os.environ["OPENBLAS_NUM_THREADS"] = str(blas_threads)
+    os.environ["OMP_NUM_THREADS"] = str(blas_threads)
+    os.environ["MKL_NUM_THREADS"] = str(blas_threads)
+    from juliacall import Main as _Main
+    _Main.seval("using LinearAlgebra")
+    _Main.seval(f"LinearAlgebra.BLAS.set_num_threads({blas_threads})")
+    here = os.path.dirname(os.path.abspath(__file__))
+    jl_path = os.path.join(here, "OSPM_Physics_Spherical.jl")
+    if not os.path.exists(jl_path):
+        raise FileNotFoundError(f"Julia backend file not found: {jl_path}")
+    # Ask Julia whether the binding exists. PythonCall's hasattr() can return a
+    # stale false result immediately after Base.include creates a new binding.
+    module_defined = bool(_Main.seval("isdefined(Main, :OSPMPhysicsSpherical)"))
+    if not module_defined:
+        # Safer HPC bridge include:
+        # pass the path as a plain Julia string inside seval instead of
+        # routing the Python string through _Main.include(jl_path).
+        import json
+        jl_path_literal = json.dumps(str(jl_path))
+        _Main.seval(f"""
+        try
+            jl_path = {jl_path_literal}
+            println("[JLINIT] Including Julia physics file: ", jl_path)
+            Base.include(Main, jl_path)
+            println("[JLINIT] Julia physics include OK")
+        catch err
+            println("[JLINIT ERROR TYPE]")
+            println(typeof(err))
+            println("[JLINIT ERROR]")
+            showerror(stdout, err)
+            println()
+            println("[JLINIT STACKTRACE]")
+            for frame in stacktrace(catch_backtrace())
+                println(frame)
+            end
+            rethrow(err)
+        end
+        """)
+
+    module_defined = bool(_Main.seval("isdefined(Main, :OSPMPhysicsSpherical)"))
+    print("[JLINIT] OSPMPhysicsSpherical defined in Main:", module_defined)
+    if not module_defined:
+        raise RuntimeError("OSPMPhysicsSpherical failed to load into Main")
+    julia_threads = int(_Main.seval("Threads.nthreads()"))
+    active_blas_threads = int(_Main.seval("LinearAlgebra.BLAS.get_num_threads()"))
+    print(
+        "[THREAD DIAG]"
+        f" assigned_cpus={assigned_cpus}"
+        f" julia_threads={julia_threads}"
+        f" blas_threads={active_blas_threads}"
+        " shared_pool_parallelism=true"
+    )
+    _JL_READY = True
+
+def _normalize_halo_parameterization(halo_parameterization=None):
+    hp = "rho_rs" if halo_parameterization is None else str(halo_parameterization).strip().lower()
+    if hp in ("", "default"):
+        hp = "rho_rs"
+    if hp not in ("rho_rs", "vcirc_rs", "v0_rc"):
+        raise ValueError(f"Unknown HALO_PARAMETERIZATION: {halo_parameterization!r}")
+    return hp
+
+def _halo_parameter_names(halo_parameterization):
+    hp = _normalize_halo_parameterization(halo_parameterization)
+    if hp == "vcirc_rs":
+        return "vcirc", "r_s"
+    if hp == "v0_rc":
+        return "v0", "r_c"
+    return "rho_s", "r_s"
+
+def normalize_halo_parameterization(halo_parameterization=None):
+    return _normalize_halo_parameterization(halo_parameterization)
+
+def _normalize_losvd_target_mode(mode=None):
+    value = "current" if mode is None else str(mode).strip().lower()
+    if value not in ("current", "resolved_stars", "mode0_observables"):
+        raise ValueError("LOSVD_TARGET_MODE must be 'current', 'resolved_stars', or 'mode0_observables'")
+    return value
+
+def _normalize_losvd_conditioning(mode=None):
+    value = "vlos_cut" if mode is None else str(mode).strip().lower()
+    if value not in ("vlos_cut", "none"):
+        raise ValueError("LOSVD_CONDITIONING must be 'vlos_cut' or 'none'")
+    return value
+
+def _normalize_losvd_fit_statistic(mode=None, losvd_target_mode="current"):
+    target_mode = _normalize_losvd_target_mode(losvd_target_mode)
+    value = ("multinomial" if target_mode == "resolved_stars" else "legacy_chi2") if mode is None else str(mode).strip().lower()
+    if value not in ("multinomial", "legacy_chi2"):
+        raise ValueError("LOSVD_FIT_STATISTIC must be 'multinomial' or 'legacy_chi2'")
+    if value == "multinomial" and target_mode != "resolved_stars":
+        raise ValueError("LOSVD_FIT_STATISTIC='multinomial' requires LOSVD_TARGET_MODE='resolved_stars'")
+    return value
+
+def _require_observables_csv(mode, observables_csv=None):
+    if mode != "mode0_observables":
+        return observables_csv
+    if observables_csv is None or not str(observables_csv).strip():
+        raise ValueError("OBSERVABLES_CSV is required for LOSVD_TARGET_MODE='mode0_observables'")
+    return str(observables_csv)
+
+def _validate_resolved_selection_edges(velocity_edges, Nvbin, v_star_mps=None, valid_vlos=None):
+    if velocity_edges is None:
+        raise ValueError("resolved_stars requires explicit VELOCITY_EDGES defining the selected sample window")
+    edges = np.asarray(velocity_edges, dtype=float).ravel()
+    if edges.size != int(Nvbin) + 1:
+        raise ValueError(f"resolved_stars VELOCITY_EDGES must contain NVBIN+1={int(Nvbin) + 1} edges; got {edges.size}")
+    if not np.isfinite(edges).all():
+        raise ValueError("resolved_stars VELOCITY_EDGES contains non-finite values")
+    if np.any(np.diff(edges) <= 0.0):
+        raise ValueError("resolved_stars VELOCITY_EDGES must be strictly increasing")
+    if v_star_mps is not None and valid_vlos is not None:
+        v = np.asarray(v_star_mps, dtype=float).ravel()
+        valid = np.asarray(valid_vlos, dtype=bool).ravel()
+        if v.size != valid.size:
+            raise ValueError("resolved_stars velocity and validity arrays must have matching lengths")
+        selected = v[valid & np.isfinite(v)]
+        outside = (selected < edges[0]) | (selected >= edges[-1])
+        if np.any(outside):
+            first_bad = float(selected[np.flatnonzero(outside)[0]]) / 1.0e3
+            raise ValueError(
+                "resolved_stars contains a selected stellar velocity outside VELOCITY_EDGES: "
+                f"v={first_bad:.12g} km/s selection=[{edges[0] / 1.0e3:.12g}, {edges[-1] / 1.0e3:.12g}) km/s"
+            )
+    return edges
+
+def nfw_vcirc_rs_to_rho_s(vcirc_kms, r_s_pc):
+    vcirc_mps = float(vcirc_kms) * kms
+    r_s_m = float(r_s_pc) * pc
+    if not np.isfinite(vcirc_mps) or not np.isfinite(r_s_m):
+        raise ValueError("vcirc and r_s must be finite for vcirc_rs conversion")
+    if r_s_m <= 0.0:
+        raise ValueError("r_s must be positive for vcirc_rs conversion")
+    rho_kg_m3 = (vcirc_mps * vcirc_mps) / (_NFW_VCIRC_DENOM * r_s_m * r_s_m)
+    return rho_kg_m3 * pc**3 / Msun
+
+def canonicalize_theta(theta, *, halo_type, halo_parameterization=None, bounds=None, require_mbh=True, require_ml=True):
+    t = np.asarray(theta, float).ravel()
+    if t.size < 2:
+        raise ValueError("theta too short")
+    hp = _normalize_halo_parameterization(halo_parameterization)
+    first_name, scale_name = _halo_parameter_names(hp)
+    if require_mbh and t.size < 3:
+        raise ValueError(f"theta missing MBH; expects [{first_name}, {scale_name}, MBH, ML]")
+    if require_ml and t.size < 4:
+        raise ValueError(f"theta missing ML; expects [{first_name}, {scale_name}, MBH, ML]")
+    ncheck = 4 if require_ml else 3
+    if not np.all(np.isfinite(t[:ncheck])):
+        raise ValueError("theta has non-finite values")
+    first = float(t[0])
+    halo_scale = float(t[1])
+    MBH = float(t[2]) if t.size >= 3 else 0.0
+    ML = float(t[3]) if t.size >= 4 else 1.0
+    ht = str(halo_type).strip().lower()
+    if hp == "v0_rc" and ht not in ("nonsingular_isothermal", "none"):
+        raise ValueError(
+            "HALO_PARAMETERIZATION='v0_rc' requires "
+            "HALO_TYPE='nonsingular_isothermal' or 'none'"
+        )
+
+    if ht == "nonsingular_isothermal" and hp != "v0_rc":
+        raise ValueError(
+            "HALO_TYPE='nonsingular_isothermal' requires "
+            "HALO_PARAMETERIZATION='v0_rc'"
+        )
+
+    if bounds is not None:
+        b = np.asarray(bounds, float)
+        need = 4 if require_ml else 3
+        if b.shape[0] < need:
+            raise ValueError(f"bounds must cover at least first {need} parameters")
+        vals = (first, halo_scale, MBH, ML)[:need]
+        for i, x in enumerate(vals):
+            lo, hi = float(b[i, 0]), float(b[i, 1])
+            if not (lo <= x <= hi):
+                raise ValueError(f"theta out of bounds at i={i}: {x} not in [{lo}, {hi}]")
+    halo_param = ( nfw_vcirc_rs_to_rho_s(first, halo_scale) if hp == "vcirc_rs" else first )
+    return (halo_param, halo_scale, MBH, ML, ht)
+
+def assert_theta_contract(theta, *, halo_type, bounds=None, require_mbh=True, require_ml=True, halo_parameterization=None):
+    return canonicalize_theta( theta, halo_type=halo_type, halo_parameterization=halo_parameterization, bounds=bounds, require_mbh=require_mbh, require_ml=require_ml )
+
+def _halo_parameterization_from_config(config=None):
+    cfg = config or {}
+    return _normalize_halo_parameterization(cfg.get("HALO_PARAMETERIZATION", "rho_rs"))
+
+def canonicalize_theta_matrix(thetas, *, halo_type, halo_parameterization=None, bounds=None):
+    theta_arr = np.asarray(thetas, dtype=float)
+    if theta_arr.ndim != 2:
+        raise RuntimeError("thetas must be a 2D array with shape (nparam, nbatch)")
+    if theta_arr.shape[0] < 4:
+        hp = _normalize_halo_parameterization(halo_parameterization)
+        first_name, scale_name = _halo_parameter_names(hp)
+        raise RuntimeError( "thetas must have shape (4, nbatch): " f"[{first_name}, {scale_name}, MBH, ML]" )
+    out = theta_arr.copy()
+    for i in range(theta_arr.shape[1]):
+        out[:4, i] = assert_theta_contract( theta_arr[:4, i], halo_type=halo_type, halo_parameterization=halo_parameterization,
+            bounds=bounds, require_mbh=True, require_ml=True)[:4]
+    return out
+
+def _as_float_vec(x, name):
+    a = np.asarray(x, float).ravel()
+    if a.size == 0:
+        raise RuntimeError(f"{name} is empty")
+    if not np.any(np.isfinite(a)):
+        raise RuntimeError(f"{name} has no finite values")
+    return a
+
+def _get_obs_arrays(obs):
+    R = getattr(obs, "R_star_m", None)
+    v = getattr(obs, "v_star_mps", None)
+    ve = getattr(obs, "verr_star_mps", None)
+    if R is None:
+        R = getattr(obs, "R_m", None)
+    if v is None:
+        v = getattr(obs, "v_mps", None)
+    if ve is None:
+        ve = getattr(obs, "verr_mps", None)
+    if R is None or v is None or ve is None:
+        raise AttributeError("obs must expose R_star_m, v_star_mps, and verr_star_mps")
+    R = _as_float_vec(R, "R_star_m")
+    v = _as_float_vec(v, "v_star_mps")
+    ve = _as_float_vec(ve, "verr_star_mps")
+    if not (R.size == v.size == ve.size):
+        raise RuntimeError("R_star_m, v_star_mps, and verr_star_mps must have matching lengths")
+    return R, v, ve
+
+def _get_valid_vlos(obs, R, v, ve):
+    valid = getattr(obs, "valid_vlos", None)
+    if valid is None:
+        valid = getattr(obs, "has_vlos", None)
+    if valid is None:
+        valid = np.ones(R.size, dtype=bool)
+    else:
+        valid = np.asarray(valid, bool).ravel()
+        if valid.size != R.size:
+            raise RuntimeError("valid_vlos/has_vlos length does not match star arrays")
+    valid = valid & np.isfinite(R) & np.isfinite(v) & np.isfinite(ve) & (ve > 0)
+    if not np.any(valid):
+        raise RuntimeError("No valid line-of-sight velocity stars")
+    return valid
+
+def _get_surface_brightness_profile(obs=None, ctx=None, config=None):
+    cfg = config or {}
+    for key in ("surface_brightness_profile", "SURFACE_BRIGHTNESS_PROFILE"):
+        if key in cfg and cfg[key] is not None:
+            return cfg[key]
+    if isinstance(ctx, dict):
+        for key in ("surface_brightness_profile", "SURFACE_BRIGHTNESS_PROFILE"):
+            if key in ctx and ctx[key] is not None:
+                return ctx[key]
+    if obs is not None:
+        for name in ("surface_brightness_profile", "SurfaceBrightnessProfile", "SURFACE_BRIGHTNESS_PROFILE"):
+            if hasattr(obs, name):
+                value = getattr(obs, name)
+                if value is not None:
+                    return value
+    raise RuntimeError( "surface_brightness_profile is required for OSPM; "
+        "no star-count fallback is allowed")
+
+def _get_physics_options(obs=None, config=None):
+    cfg = config or {}
+
+    def grab(name, default):
+        if name in cfg:
+            return cfg[name]
+        upper = name.upper()
+        if upper in cfg:
+            return cfg[upper]
+        if obs is not None and hasattr(obs, name):
+            return getattr(obs, name)
+        if obs is not None and hasattr(obs, upper):
+            return getattr(obs, upper)
+        return default
+    velocity_edges = grab("velocity_edges", None)
+    light_bin_edges_pc = grab("light_bin_edges_pc", None)
+    kinematic_bin_edges_pc = grab("kinematic_bin_edges_pc", None)
+    losvd_target_mode = _normalize_losvd_target_mode(grab("losvd_target_mode", "current"))
+    observables_csv = _require_observables_csv(losvd_target_mode, grab("observables_csv", None))
+    losvd_conditioning = _normalize_losvd_conditioning(grab("losvd_conditioning", None))
+    losvd_fit_statistic = _normalize_losvd_fit_statistic(grab("losvd_fit_statistic", None), losvd_target_mode)
+    return {
+        "Nvbin": int(grab("Nvbin", 21)),
+        "Ntheta_launch": int(grab("Ntheta_launch", 9)),
+        "velocity_edges": velocity_edges,
+        "light_bin_edges_pc": light_bin_edges_pc,
+        "kinematic_bin_edges_pc": kinematic_bin_edges_pc,
+        "tracer_constraint_mode": str(grab("tracer_constraint_mode", "projected_light")).strip().lower(),
+        "losvd_target_mode": losvd_target_mode,
+        "losvd_conditioning": losvd_conditioning,
+        "losvd_fit_statistic": losvd_fit_statistic,
+        "resolved_kde_grid": int(grab("resolved_kde_grid", 17)),
+        "resolved_kde_width_bins": float(grab("resolved_kde_width_bins", 3.0)),
+        "resolved_vmin_kms": float(grab("resolved_vmin_kms", -25.0)),
+        "resolved_vmax_kms": float(grab("resolved_vmax_kms", 25.0)),
+        "resolved_bootstraps": int(grab("resolved_bootstraps", 300)),
+        "resolved_envelope_floor": float(grab("resolved_envelope_floor", 0.003)),
+        "observables_csv": observables_csv,
+        "halo_q_axis_ratio": float(grab("halo_q_axis_ratio", 1.0)),
+        "halo_params": grab("halo_params", None),
+        "fill_pct": float(grab("orbit_fill_pct", 0.85)),
+        "regional_floor": float(grab("orbit_regional_floor", 0.80)),
+        "max_regional_gap": float(grab("orbit_max_regional_gap", 0.10)),
+        "shell_band_count": int(grab("orbit_shell_bands", 8)),
+    }
+
+def mass_enclosed_two_radii_julia(*, r_in_m, r_out_m, theta, halo_type, stellar_model=None, halo_parameterization=None):
+    if not USE_JULIA:
+        raise RuntimeError("Julia required")
+    _jl_init()
+    rho_s, r_s, MBH, ML, ht = assert_theta_contract(theta, halo_type=halo_type, halo_parameterization=halo_parameterization, require_mbh=True, require_ml=True)
+    Min, Mout = _Main.OSPMPhysicsSpherical.mass_enclosed_two_radii( float(r_in_m), float(r_out_m), float(rho_s), float(r_s), float(MBH), float(ML), str(ht), stellar_model=stellar_model)
+    return float(Min), float(Mout)
+
+def make_inclination(inclination_deg: float):
+    inc = np.radians(float(inclination_deg))
+    sini = float(np.sin(inc))
+    cosi = float(np.cos(inc))
+    edge_on = float(inclination_deg) >= 85.0
+    return sini, cosi, edge_on
+
+def halo_from_theta_astro(theta, halo_type="nfw", halo_parameterization=None):
+    rho_s, r_s, MBH, ML, ht = assert_theta_contract( theta, halo_type=halo_type, halo_parameterization=halo_parameterization, require_mbh=True, require_ml=True,)
+    return {"rho_s": rho_s, "r_s": r_s, "MBH": MBH, "ML": ML, "type": ht}
+
+def build_dynamics_context(*, theta, halo_type, stellar_model=None, surface_brightness_profile=None, halo_parameterization=None, **_ignored):
+    if not USE_JULIA:
+        raise RuntimeError("Python backend is disabled. Set OSPM_USE_JULIA=1.")
+    ctx = { "halo": halo_from_theta_astro(theta, halo_type=halo_type, halo_parameterization=halo_parameterization), "stellar_model": stellar_model, }
+    if surface_brightness_profile is not None:
+        ctx["surface_brightness_profile"] = surface_brightness_profile
+    return ctx
+
+def halo_kwargs_from_ctx(ctx):
+    halo = ctx["halo"] if isinstance(ctx, dict) else ctx.halo
+    for k in ("rho_s", "r_s", "MBH", "ML", "type"):
+        if k not in halo:
+            raise KeyError(f"halo missing required key '{k}'")
+    return { "rho_s": float(halo["rho_s"]), "r_s": float(halo["r_s"]), "MBH": float(halo["MBH"]), "ML": float(halo["ML"]), "halo_type": str(halo["type"]),}
+
+def build_A_matrix_julia(*, R_star_m, valid_vlos, v_star_mps, verr_star_mps, sini, Norbit, theta, halo_type, stellar_model=None, surface_brightness_profile=None, halo_parameterization=None,
+    tracer_constraint_mode="projected_light", diag=False, velocity_edges=None, light_bin_edges_pc=None, kinematic_bin_edges_pc=None, Nvbin=21, Ntheta_launch=9, halo_q_axis_ratio=1.0, halo_params=None,
+    losvd_target_mode="current", resolved_kde_grid=17, resolved_kde_width_bins=3.0, resolved_vmin_kms=-25.0, resolved_vmax_kms=25.0,
+    resolved_bootstraps=300, resolved_envelope_floor=0.003, observables_csv=None,
+    fill_pct=0.85, regional_floor=0.80, max_regional_gap=0.10, shell_band_count=8):
+    if not USE_JULIA:
+        raise RuntimeError("OSPM A-matrix mode requires Julia")
+    if surface_brightness_profile is None:
+        raise RuntimeError("surface_brightness_profile is required for OSPM;" "no star-count fallback is allowed")
+    _jl_init()
+    rho_s, r_s, MBH, ML, ht = assert_theta_contract( theta, halo_type=halo_type, halo_parameterization=halo_parameterization, require_mbh=True, require_ml=True)
+    PC = _Main.PythonCall
+    VecF = _Main.Vector[_Main.Float64]
+    VecB = _Main.Vector[_Main.Bool]
+    R_py = np.asarray(R_star_m, dtype=float).ravel()
+    valid_py = np.asarray(valid_vlos, dtype=bool).ravel()
+    v_py = np.asarray(v_star_mps, dtype=float).ravel()
+    ve_py = np.asarray(verr_star_mps, dtype=float).ravel()
+    if not (R_py.size == valid_py.size == v_py.size == ve_py.size):
+        raise RuntimeError("R_star_m, valid_vlos, v_star_mps, and verr_star_mps must match")
+    Rj = PC.pyconvert(VecF, R_py)
+    validj = PC.pyconvert(VecB, valid_py)
+    vj = PC.pyconvert(VecF, v_py)
+    vej = PC.pyconvert(VecF, ve_py)
+    tracer_constraint_mode = str(tracer_constraint_mode).strip().lower()
+    if tracer_constraint_mode not in ("projected_light", "density_3d"):
+        raise ValueError("tracer_constraint_mode must be 'projected_light' or 'density_3d'")
+    losvd_target_mode = _normalize_losvd_target_mode(losvd_target_mode)
+    observables_csv = _require_observables_csv(losvd_target_mode, observables_csv)
+    if losvd_target_mode == "resolved_stars":
+        velocity_edges = _validate_resolved_selection_edges(velocity_edges, Nvbin, v_py, valid_py)
+    kwargs = dict( stellar_model=stellar_model, surface_brightness_profile=surface_brightness_profile, tracer_constraint_mode=tracer_constraint_mode, diag=bool(diag), Nvbin=int(Nvbin), Ntheta_launch=int(Ntheta_launch), halo_q_axis_ratio=float(halo_q_axis_ratio),
+        halo_params=halo_params, losvd_target_mode=losvd_target_mode, resolved_kde_grid=int(resolved_kde_grid), resolved_kde_width_bins=float(resolved_kde_width_bins),
+        resolved_vmin_kms=float(resolved_vmin_kms), resolved_vmax_kms=float(resolved_vmax_kms), resolved_bootstraps=int(resolved_bootstraps),
+        resolved_envelope_floor=float(resolved_envelope_floor), fill_pct=float(fill_pct), regional_floor=float(regional_floor), max_regional_gap=float(max_regional_gap), shell_band_count=int(shell_band_count))
+    if observables_csv is not None:
+        kwargs["observables_csv"] = observables_csv
+    if velocity_edges is not None:
+        kwargs["velocity_edges"] = PC.pyconvert(VecF, np.asarray(velocity_edges, dtype=float).ravel())
+    if light_bin_edges_pc is not None:
+        kwargs["light_bin_edges"] = PC.pyconvert( VecF, np.asarray(light_bin_edges_pc, dtype=float).ravel() * pc )
+    if kinematic_bin_edges_pc is not None:
+        kwargs["kinematic_bin_edges"] = PC.pyconvert( VecF, np.asarray(kinematic_bin_edges_pc, dtype=float).ravel() * pc )
+    out = _Main.OSPMPhysicsSpherical.build_A_matrix_hybrid( int(Norbit), Rj, validj, vj, vej, float(sini), float(rho_s), float(r_s), float(MBH), float(ML), str(ht), **kwargs)
+    if diag:
+        A, meta = out
+        return np.asarray(A, float), dict(meta)
+    return np.asarray(out, float)
+
+def build_A_matrix(obs, ctx, *, diag=False, config=None):
+    mode = str(getattr(obs, "mode", "stellar")).strip().lower()
+    if mode not in ("stellar", "ospm", "losvd"):
+        raise RuntimeError("build_A_matrix supports obs.mode in {'stellar', 'ospm', 'losvd'} for OSPM OSPM")
+    hk = halo_kwargs_from_ctx(ctx)
+    theta = [hk["rho_s"], hk["r_s"], hk["MBH"], hk["ML"]]
+    halo_type = hk["halo_type"]
+    canonical_parameterization = ("v0_rc" if halo_type.strip().lower() == "nonsingular_isothermal" else None)
+    stellar_model = (ctx.get("stellar_model", getattr(obs, "stellar_model", None))
+        if isinstance(ctx, dict)
+        else getattr(ctx, "stellar_model", getattr(obs, "stellar_model", None)))
+    surface_brightness_profile = _get_surface_brightness_profile(obs=obs, ctx=ctx, config=config)
+    R, v, ve = _get_obs_arrays(obs)
+    valid = _get_valid_vlos(obs, R, v, ve)
+    opts = _get_physics_options(obs=obs, config=config)
+    return build_A_matrix_julia( R_star_m=R, valid_vlos=valid, v_star_mps=v, verr_star_mps=ve, sini=float(obs.sini), Norbit=int(obs.Norbit), theta=theta, halo_type=halo_type,
+        stellar_model=stellar_model, surface_brightness_profile=surface_brightness_profile, halo_parameterization=canonical_parameterization, tracer_constraint_mode=opts["tracer_constraint_mode"],
+        diag=bool(diag), velocity_edges=opts["velocity_edges"], light_bin_edges_pc=opts["light_bin_edges_pc"], kinematic_bin_edges_pc=opts["kinematic_bin_edges_pc"],
+        Nvbin=opts["Nvbin"], Ntheta_launch=opts["Ntheta_launch"], halo_q_axis_ratio=opts["halo_q_axis_ratio"], halo_params=opts["halo_params"],
+        losvd_target_mode=opts["losvd_target_mode"], resolved_kde_grid=opts["resolved_kde_grid"], resolved_kde_width_bins=opts["resolved_kde_width_bins"],
+        resolved_vmin_kms=opts["resolved_vmin_kms"], resolved_vmax_kms=opts["resolved_vmax_kms"], resolved_bootstraps=opts["resolved_bootstraps"],
+        resolved_envelope_floor=opts["resolved_envelope_floor"], observables_csv=opts["observables_csv"],
+        fill_pct=opts["fill_pct"], regional_floor=opts["regional_floor"], max_regional_gap=opts["max_regional_gap"], shell_band_count=opts["shell_band_count"])
+
+def build_A_matrix_from_theta(obs, theta, *, halo_type="nfw", diag=False, config=None):
+    surface_brightness_profile = _get_surface_brightness_profile(obs=obs, config=config)
+    halo_parameterization = _halo_parameterization_from_config(config)
+    ctx = build_dynamics_context( theta=theta, halo_type=halo_type, halo_parameterization=halo_parameterization, stellar_model=getattr(obs, "stellar_model", None), surface_brightness_profile=surface_brightness_profile,)
+    return build_A_matrix(obs, ctx, diag=bool(diag), config=config)
+
+def evaluate_batch_theta_julia(*, thetas, obs, halo_type, stellar_model=None, surface_brightness_profile=None, Norbit=None, config=None):
+    """
+    Sole Python -> Julia batch-evaluation boundary.
+    External theta:
+        [vcirc, r_s, MBH, ML] when HALO_PARAMETERIZATION="vcirc_rs"
+        [v0, r_c, MBH, ML] when HALO_PARAMETERIZATION="v0_rc"
+    Canonical positional theta sent to Julia:
+        [rho_s, r_s, MBH, ML] for rho_rs and vcirc_rs
+        [v0, r_c, MBH, ML] for v0_rc
+    This function owns:
+        - theta canonicalization
+        - observational arrays
+        - stellar model
+        - full-light profile
+        - light and kinematic bins
+        - velocity bins
+        - halo options
+        - expanded-CM convergence options
+        - orbit coverage and timeout options
+        - Smart Run shared-worker-pool scheduling options
+    """
+    if not USE_JULIA:
+        raise RuntimeError("OSPM batch mode requires Julia")
+    import json
+    cfg = dict(config or {})
+    observable_cfg = cfg.get("OBSERVABLES", {}) or {}
+    if not isinstance(observable_cfg, dict):
+        raise TypeError("config['OBSERVABLES'] must be a dict")
+    def opt(*names, default=None):
+        for source in (observable_cfg, cfg):
+            for name in names:
+                if name in source and source[name] is not None:
+                    return source[name]
+        for name in names:
+            if hasattr(obs, name):
+                value = getattr(obs, name)
+                if value is not None:
+                    return value
+        return default
+    if stellar_model is None:
+        stellar_model = opt( "STELLAR_MODEL", "stellar_model", default=getattr(obs, "stellar_model", None))
+    if surface_brightness_profile is None:
+        surface_brightness_profile = opt( "SURFACE_BRIGHTNESS_PROFILE", "surface_brightness_profile", default=None)
+    if surface_brightness_profile is None:
+        surface_brightness_profile = _get_surface_brightness_profile( obs=obs, config=cfg )
+    light_bin_edges_pc = opt( "LIGHT_BIN_EDGES_PC", "light_bin_edges_pc", default=None)
+    kinematic_bin_edges_pc = opt("KINEMATIC_BIN_EDGES_PC", "kinematic_bin_edges_pc", default=None)
+    velocity_edges = opt( "VELOCITY_EDGES", "velocity_edges", default=None)
+    tracer_constraint_mode = str(opt("TRACER_CONSTRAINT_MODE", "tracer_constraint_mode", default="projected_light")).strip().lower()
+    if tracer_constraint_mode not in ("projected_light", "density_3d"):
+        raise ValueError("TRACER_CONSTRAINT_MODE must be 'projected_light' or 'density_3d'")
+    if light_bin_edges_pc is None:
+        raise RuntimeError("light_bin_edges_pc is required")
+    if kinematic_bin_edges_pc is None:
+        raise RuntimeError("kinematic_bin_edges_pc is required")
+    losvd_target_mode = _normalize_losvd_target_mode(opt("LOSVD_TARGET_MODE", "losvd_target_mode", default="current"))
+    losvd_conditioning = _normalize_losvd_conditioning(opt("LOSVD_CONDITIONING", "losvd_conditioning", default=None))
+    losvd_fit_statistic = _normalize_losvd_fit_statistic(opt("LOSVD_FIT_STATISTIC", "losvd_fit_statistic", default=None), losvd_target_mode)
+    resolved_kde_grid = int(opt("RESOLVED_KDE_GRID", "resolved_kde_grid", default=17))
+    resolved_kde_width_bins = float(opt("RESOLVED_KDE_WIDTH_BINS", "resolved_kde_width_bins", default=3.0))
+    resolved_vmin_kms = float(opt("RESOLVED_VMIN_KMS", "resolved_vmin_kms", default=-25.0))
+    resolved_vmax_kms = float(opt("RESOLVED_VMAX_KMS", "resolved_vmax_kms", default=25.0))
+    resolved_bootstraps = int(opt("RESOLVED_BOOTSTRAPS", "resolved_bootstraps", default=300))
+    resolved_envelope_floor = float(opt("RESOLVED_ENVELOPE_FLOOR", "resolved_envelope_floor", default=0.003))
+    observables_csv = _require_observables_csv(
+        losvd_target_mode,
+        opt("OBSERVABLES_CSV", "observables_csv", default=None),
+    )
+    if losvd_target_mode == "resolved_stars":
+        if resolved_kde_grid <= 1:
+            raise ValueError("RESOLVED_KDE_GRID must exceed one")
+        if not np.isfinite(resolved_kde_width_bins) or resolved_kde_width_bins <= 0.0:
+            raise ValueError("RESOLVED_KDE_WIDTH_BINS must be finite and positive")
+        if not np.isfinite(resolved_vmin_kms) or not np.isfinite(resolved_vmax_kms) or resolved_vmax_kms <= resolved_vmin_kms:
+            raise ValueError("RESOLVED_VMIN_KMS/RESOLVED_VMAX_KMS define an invalid velocity range")
+        if resolved_bootstraps <= 1:
+            raise ValueError("RESOLVED_BOOTSTRAPS must exceed one")
+        if not np.isfinite(resolved_envelope_floor) or resolved_envelope_floor < 0.0:
+            raise ValueError("RESOLVED_ENVELOPE_FLOOR must be finite and nonnegative")
+    Nvbin = int(opt("NVBIN", "Nvbin", "nvbin", default=21))
+    Ntheta_launch = int( opt("NTHETA_LAUNCH", "Ntheta_launch", "ntheta_launch", default=9))
+    alphat = float(opt("ALPHAT", "alphat", default=cfg.get("ALPHAT", 1.0)))
+    apfac = float(opt("APFAC", "apfac", default=0.01))
+    light_rel_tol = float(opt("LIGHT_REL_TOL", "light_rel_tol", default=0.01))
+    light_sigma_tol = float(opt("LIGHT_SIGMA_TOL", "light_sigma_tol", default=2.0))
+    delta_chi2_iter_tol = float(opt("DELTA_CHI2_ITER_TOL", "delta_chi2_iter_tol", default=0.3))
+    delta_statistic_iter_tol = float(opt("DELTA_STATISTIC_ITER_TOL", "delta_statistic_iter_tol", default=delta_chi2_iter_tol))
+    maxiter = int( opt("MAXITER", "MAXITER", "maxiter", default=60))
+    entropy_floor = float(opt("ENTROPY_FLOOR", "entropy_floor", default=1e-30))
+    timeout_s = float(opt( "EVAL_TIMEOUT_S", "EVAL_TIMEOUT", "timeout_s", default=120.0, ))
+    R_inner_pc = float(opt("R_INNER_DIAG_PC", "R_inner_pc", default=30.0))
+    halo_q_axis_ratio = float( opt( "HALO_Q_AXIS_RATIO", "halo_q_axis_ratio", default=1.0, ))
+    halo_params = opt("HALO_PARAMS", "halo_params", default=None)
+    orbit_fill_pct = float(opt("ORBIT_FILL_PCT", "orbit_fill_pct", default=0.85))
+    orbit_regional_floor = float(opt("ORBIT_REGIONAL_FLOOR", "orbit_regional_floor", default=0.80))
+    orbit_max_regional_gap = float(opt("ORBIT_MAX_REGIONAL_GAP", "orbit_max_regional_gap", default=0.10))
+    orbit_shell_bands = int(opt("ORBIT_SHELL_BANDS", "orbit_shell_bands", default=8))
+    orbit_coverage_check_every = int(opt("ORBIT_COVERAGE_CHECK_EVERY", "orbit_coverage_check_every", default=50))
+    orbit_warn_fill_pct = float(opt("ORBIT_WARN_FILL_PCT", "orbit_warn_fill_pct", default=0.95))
+    orbit_warn_success_pct = float(opt("ORBIT_WARN_SUCCESS_PCT", "orbit_warn_success_pct", default=0.99))
+    orbit_warn_regional_floor = float(opt("ORBIT_WARN_REGIONAL_FLOOR", "orbit_warn_regional_floor", default=0.80))
+    orbit_warn_max_regional_gap = float(opt("ORBIT_WARN_MAX_REGIONAL_GAP", "orbit_warn_max_regional_gap", default=0.15))
+    requested_model_owner_limit = int(opt("MODEL_OWNER_LIMIT", "model_owner_limit", default=0))
+    preferred_threads_per_model = int(opt("THREADS_PER_MODEL", "CPUS_PER_MODEL", "threads_per_model", default=8))
+    smart_run_min_cpus = int(opt("SMART_RUN_MIN_CPUS_PER_MODEL", default=5))
+    smart_run_max_cpus = int(opt("SMART_RUN_MAX_CPUS_PER_MODEL", default=20))
+    if preferred_threads_per_model <= 0:
+        raise ValueError("THREADS_PER_MODEL must be positive")
+    if requested_model_owner_limit < 0:
+        raise ValueError("MODEL_OWNER_LIMIT must be >= 0; use 0 for automatic Smart Run scheduling")
+    R, v, ve = _get_obs_arrays(obs)
+    valid = _get_valid_vlos(obs, R, v, ve)
+    if losvd_target_mode == "resolved_stars":
+        velocity_edges = _validate_resolved_selection_edges(velocity_edges, Nvbin, v, valid)
+
+    if Norbit is None:
+        Norbit = int(getattr(obs, "Norbit"))
+    if Norbit % 2 != 0:
+        raise RuntimeError("OSPM paired-orbit mode requires an even Norbit; "f"got Norbit={Norbit}" )
+
+    pre_pool, _ = _runtime_shared_pool_plan(
+        preferred_threads_per_model=preferred_threads_per_model,
+        min_cpus_per_model=smart_run_min_cpus,
+        max_cpus_per_model=smart_run_max_cpus,
+        requested_model_owner_limit=requested_model_owner_limit,
+    )
+    _jl_init(assigned_cpus=pre_pool.total_workers, threads_per_model=pre_pool.workers_per_model, shared_pool=True)
+    julia_threads = int(_Main.seval("Threads.nthreads()"))
+    shared_pool, resource_snapshot = _runtime_shared_pool_plan(
+        preferred_threads_per_model=preferred_threads_per_model,
+        min_cpus_per_model=smart_run_min_cpus,
+        max_cpus_per_model=smart_run_max_cpus,
+        requested_model_owner_limit=requested_model_owner_limit,
+        julia_threads=julia_threads,
+    )
+    threads_per_model = shared_pool.workers_per_model
+    initial_model_owners = shared_pool.initial_model_owners
+    total_workers = shared_pool.total_workers
+    reserve_workers = shared_pool.reserve_workers
+    admission_worker_limit = shared_pool.admission_worker_limit
+    print(
+        "[SMART RUN BRIDGE]"
+        f" source={resource_snapshot.source}"
+        f" total_workers={total_workers}"
+        f" threads_per_model={threads_per_model}"
+        f" initial_model_owners={initial_model_owners}"
+        f" reserve_workers={reserve_workers}"
+        f" admission_worker_limit={admission_worker_limit}"
+        f" dynamic_admission={shared_pool.dynamic_admission}"
+        f" whole_model_admission={shared_pool.whole_model_admission}"
+        f" finishing_priority={shared_pool.finishing_priority}"
+    )
+    halo_parameterization = _halo_parameterization_from_config(cfg)
+    theta_arr = canonicalize_theta_matrix( thetas, halo_type=halo_type, halo_parameterization=halo_parameterization, bounds=cfg.get("THETA_BOUNDS"))
+    def jl_matrix_f64(value, name):
+        arr = np.asarray(value, dtype=np.float64)
+        if arr.ndim != 2:
+            raise ValueError(f"{name} must be two-dimensional")
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{name} contains non-finite values")
+        nrow, ncol = arr.shape
+        _Main._ospm_matrix_flat = arr.ravel(order="F").tolist()
+        _Main._ospm_matrix_nrow = int(nrow)
+        _Main._ospm_matrix_ncol = int(ncol)
+        return _Main.seval("""reshape( Float64[x for x in _ospm_matrix_flat], _ospm_matrix_nrow, _ospm_matrix_ncol)""")
+    def jl_vector_f64(value, name):
+        arr = np.asarray(value, dtype=np.float64).ravel()
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{name} contains non-finite values")
+        _Main._ospm_vector_f64 = arr.tolist()
+        return _Main.seval( "Float64[x for x in _ospm_vector_f64]")
+    def jl_vector_bool(value):
+        arr = np.asarray(value, dtype=bool).ravel()
+        _Main._ospm_vector_bool = arr.tolist()
+        return _Main.seval( "Bool[x for x in _ospm_vector_bool]" )
+    def julia_literal(value, name):
+        if isinstance(value, np.generic):
+            value = value.item()
+        if value is None:
+            return "nothing"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            if not np.isfinite(value):
+                raise ValueError(f"{name} contains a non-finite value")
+            return repr(value)
+        if isinstance(value, str):
+            return json.dumps(value)
+        raise TypeError(
+            f"{name} contains unsupported value type "
+            f"{type(value).__name__}"
+        )
+    def jl_primitive_dict(value, name):
+        if value is None:
+            return _Main.seval("nothing")
+        if not isinstance(value, dict):
+            raise TypeError(f"{name} must be a dict or None")
+        entries = []
+        for key, item in value.items():
+            key_literal = json.dumps(str(key))
+            value_literal = julia_literal(item, name)
+            entries.append(f"{key_literal} => {value_literal}")
+        expression = "Dict{String,Any}(" + ", ".join(entries) + ")"
+        return _Main.seval(expression)
+    def jl_surface_brightness_profile(profile):
+        required = ("R_pc", "R_inner_pc", "R_outer_pc", "light_frac", "Sigma", "Sigma_err")
+        missing = [key for key in required if key not in profile]
+        if missing:
+            raise KeyError( "surface_brightness_profile is missing " + ", ".join(missing))
+        _Main._ospm_sb_R_pc = jl_vector_f64( profile["R_pc"], "surface_brightness_profile.R_pc",)
+        _Main._ospm_sb_R_inner_pc = jl_vector_f64( profile["R_inner_pc"], "surface_brightness_profile.R_inner_pc" )
+        _Main._ospm_sb_R_outer_pc = jl_vector_f64( profile["R_outer_pc"], "surface_brightness_profile.R_outer_pc")
+        _Main._ospm_sb_light_frac = jl_vector_f64( profile["light_frac"], "surface_brightness_profile.light_frac",)
+        _Main._ospm_sb_Sigma = jl_vector_f64( profile["Sigma"], "surface_brightness_profile.Sigma")
+        _Main._ospm_sb_Sigma_err = jl_vector_f64( profile["Sigma_err"], "surface_brightness_profile.Sigma_err")
+        return _Main.seval("""Dict{Symbol,Any}(:R_pc => _ospm_sb_R_pc, :R_inner_pc => _ospm_sb_R_inner_pc, :R_outer_pc => _ospm_sb_R_outer_pc,
+                :light_frac => _ospm_sb_light_frac, :Sigma => _ospm_sb_Sigma, :Sigma_err => _ospm_sb_Sigma_err)""")
+
+    _Main._ospm_theta = jl_matrix_f64(theta_arr, "thetas")
+    _Main._ospm_R = jl_vector_f64(R, "R_star_m")
+    _Main._ospm_valid = jl_vector_bool(valid)
+    _Main._ospm_v = jl_vector_f64(v, "v_star_mps")
+    _Main._ospm_ve = jl_vector_f64(ve, "verr_star_mps")
+    _Main._ospm_light_edges = jl_vector_f64( np.asarray(light_bin_edges_pc, dtype=float) * pc, "light_bin_edges_pc")
+    _Main._ospm_kinematic_edges = jl_vector_f64( np.asarray(kinematic_bin_edges_pc, dtype=float) * pc, "kinematic_bin_edges_pc")
+    if velocity_edges is None:
+        _Main._ospm_velocity_edges = _Main.seval("nothing")
+    else:
+        _Main._ospm_velocity_edges = jl_vector_f64(velocity_edges, "velocity_edges")
+    _Main._ospm_stellar_model = jl_primitive_dict( stellar_model, "stellar_model")
+    _Main._ospm_halo_params = jl_primitive_dict( halo_params, "halo_params")
+    _Main._ospm_sb_profile = jl_surface_brightness_profile( surface_brightness_profile )
+    _Main.seval(f"_ospm_sini = {float(obs.sini)!r}")
+    _Main.seval("_ospm_tracer_constraint_mode = " + json.dumps(tracer_constraint_mode))
+    _Main.seval("_ospm_losvd_target_mode = " + json.dumps(losvd_target_mode))
+    _Main.seval("_ospm_losvd_conditioning = " + json.dumps(losvd_conditioning))
+    _Main.seval("_ospm_losvd_fit_statistic = " + json.dumps(losvd_fit_statistic))
+    _Main.seval(f"_ospm_resolved_kde_grid = {resolved_kde_grid}")
+    _Main.seval(f"_ospm_resolved_kde_width_bins = {resolved_kde_width_bins!r}")
+    _Main.seval(f"_ospm_resolved_vmin_kms = {resolved_vmin_kms!r}")
+    _Main.seval(f"_ospm_resolved_vmax_kms = {resolved_vmax_kms!r}")
+    _Main.seval(f"_ospm_resolved_bootstraps = {resolved_bootstraps}")
+    _Main.seval(f"_ospm_resolved_envelope_floor = {resolved_envelope_floor!r}")
+    _Main.seval("_ospm_observables_csv = " + ("nothing" if observables_csv is None else json.dumps(observables_csv)))
+    _Main.seval(f"_ospm_Norbit = {int(Norbit)}")
+    _Main.seval("_ospm_halo_type = " + json.dumps(str(halo_type)))
+    _Main.seval(f"_ospm_alphat = {alphat!r}")
+    _Main.seval(f"_ospm_apfac = {apfac!r}")
+    _Main.seval(f"_ospm_light_rel_tol = {light_rel_tol!r}")
+    _Main.seval(f"_ospm_light_sigma_tol = {light_sigma_tol!r}")
+    _Main.seval(f"_ospm_delta_chi2_iter_tol = {delta_chi2_iter_tol!r}")
+    _Main.seval(f"_ospm_delta_statistic_iter_tol = {delta_statistic_iter_tol!r}")
+    _Main.seval(f"_ospm_entropy_floor = {entropy_floor!r}")
+    _Main.seval(f"_ospm_maxiter = {maxiter}")
+    _Main.seval(f"_ospm_timeout_s = {timeout_s!r}")
+    _Main.seval(f"_ospm_R_inner_pc = {R_inner_pc!r}")
+    _Main.seval(f"_ospm_Nvbin = {Nvbin}")
+    _Main.seval(f"_ospm_Ntheta_launch = {Ntheta_launch}")
+    _Main.seval(f"_ospm_halo_q_axis_ratio = {halo_q_axis_ratio!r}")
+    _Main.seval(f"_ospm_orbit_fill_pct = {orbit_fill_pct!r}")
+    _Main.seval(f"_ospm_orbit_regional_floor = {orbit_regional_floor!r}")
+    _Main.seval(f"_ospm_orbit_max_regional_gap = {orbit_max_regional_gap!r}")
+    _Main.seval(f"_ospm_orbit_shell_bands = {orbit_shell_bands}")
+    _Main.seval(f"_ospm_orbit_coverage_check_every = {orbit_coverage_check_every}")
+    _Main.seval(f"_ospm_orbit_warn_fill_pct = {orbit_warn_fill_pct!r}")
+    _Main.seval(f"_ospm_orbit_warn_success_pct = {orbit_warn_success_pct!r}")
+    _Main.seval(f"_ospm_orbit_warn_regional_floor = {orbit_warn_regional_floor!r}")
+    _Main.seval(f"_ospm_orbit_warn_max_regional_gap = {orbit_warn_max_regional_gap!r}")
+    _Main.seval(f"_ospm_model_owner_limit = {requested_model_owner_limit}")
+    _Main.seval(f"_ospm_initial_model_owners = {initial_model_owners}")
+    _Main.seval(f"_ospm_threads_per_model = {threads_per_model}")
+    _Main.seval(f"_ospm_total_workers = {total_workers}")
+    _Main.seval(f"_ospm_reserve_workers = {reserve_workers}")
+    _Main.seval(f"_ospm_admission_worker_limit = {admission_worker_limit}")
+    _Main.seval(f"_ospm_dynamic_admission = {'true' if shared_pool.dynamic_admission else 'false'}")
+    _Main.seval(f"_ospm_whole_model_admission = {'true' if shared_pool.whole_model_admission else 'false'}")
+    _Main.seval(f"_ospm_finishing_priority = {'true' if shared_pool.finishing_priority else 'false'}")
+
+    out = _Main.seval("""OSPMPhysicsSpherical.evaluate_batch_theta(_ospm_theta, _ospm_R, _ospm_valid, _ospm_v, _ospm_ve, _ospm_sini, _ospm_Norbit, _ospm_halo_type;
+            stellar_model=_ospm_stellar_model, surface_brightness_profile=_ospm_sb_profile, tracer_constraint_mode=_ospm_tracer_constraint_mode,
+            losvd_target_mode=_ospm_losvd_target_mode, losvd_conditioning=_ospm_losvd_conditioning, losvd_fit_statistic=_ospm_losvd_fit_statistic, resolved_kde_grid=_ospm_resolved_kde_grid, resolved_kde_width_bins=_ospm_resolved_kde_width_bins,
+            resolved_vmin_kms=_ospm_resolved_vmin_kms, resolved_vmax_kms=_ospm_resolved_vmax_kms, resolved_bootstraps=_ospm_resolved_bootstraps,
+            resolved_envelope_floor=_ospm_resolved_envelope_floor, observables_csv=_ospm_observables_csv,
+            alphat=_ospm_alphat, apfac=_ospm_apfac, light_rel_tol=_ospm_light_rel_tol, light_sigma_tol=_ospm_light_sigma_tol, delta_chi2_iter_tol=_ospm_delta_chi2_iter_tol, delta_statistic_iter_tol=_ospm_delta_statistic_iter_tol,
+            entropy_floor=_ospm_entropy_floor, maxiter=_ospm_maxiter, timeout_s=_ospm_timeout_s, fill_pct=_ospm_orbit_fill_pct, regional_floor=_ospm_orbit_regional_floor,
+            max_regional_gap=_ospm_orbit_max_regional_gap, shell_band_count=_ospm_orbit_shell_bands, coverage_check_every=_ospm_orbit_coverage_check_every,
+            warn_fill_pct=_ospm_orbit_warn_fill_pct, warn_success_pct=_ospm_orbit_warn_success_pct, warn_regional_floor=_ospm_orbit_warn_regional_floor,
+            warn_max_regional_gap=_ospm_orbit_warn_max_regional_gap, model_owner_limit=_ospm_model_owner_limit, initial_model_owners=_ospm_initial_model_owners,
+            threads_per_model=_ospm_threads_per_model, total_workers=_ospm_total_workers, reserve_workers=_ospm_reserve_workers, admission_worker_limit=_ospm_admission_worker_limit,
+            dynamic_admission=_ospm_dynamic_admission, whole_model_admission=_ospm_whole_model_admission, finishing_priority=_ospm_finishing_priority,
+            R_inner_pc=_ospm_R_inner_pc, velocity_edges=_ospm_velocity_edges, light_bin_edges=_ospm_light_edges, kinematic_bin_edges=_ospm_kinematic_edges,
+            Nvbin=_ospm_Nvbin, Ntheta_launch=_ospm_Ntheta_launch, halo_q_axis_ratio=_ospm_halo_q_axis_ratio, halo_params=_ospm_halo_params)""")
+
+    return tuple(np.asarray(value) for value in out)
+
+def force_at_rtheta_julia(*, r_m, theta_rad, theta, halo_type, stellar_model=None, halo_parameterization=None):
+    if not USE_JULIA:
+        raise RuntimeError("Julia required")
+    _jl_init()
+    rho_s, r_s, MBH, ML, ht = assert_theta_contract( theta, halo_type=halo_type, halo_parameterization=halo_parameterization, require_mbh=True, require_ml=True)
+    fr, ftheta, FR, FZ = _Main.OSPMPhysicsSpherical.force_at_rtheta( float(r_m), float(theta_rad), float(rho_s), float(r_s), float(MBH), float(ML), str(ht), stellar_model=stellar_model)
+    return { "fr": float(fr), "ftheta": float(ftheta), "FR": float(FR), "FZ": float(FZ)}

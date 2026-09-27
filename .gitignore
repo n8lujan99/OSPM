@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Python environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Conda / Julia local state
+.CondaPkg/
+.conda/
+.julia/
+
+# Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# OSPM runtime products
+Logs/
+logs/
+checkpoints/
+checkpoint/
+Dump/
+dump/
+
+# Generated figures
+*.png
+*.pdf
+
+# Generated / scratch model output
+Data/Galaxy_Profiles/*/default/
+Data/Galaxy_Profiles/*/plots/
+Data/Galaxy_Profiles/*/archive/
+
+# Local notes and scratch
+OSPM-NOTES/
+scratch/
+tmp/
+
+# Windows alternate data stream metadata
+*:Zone.Identifier

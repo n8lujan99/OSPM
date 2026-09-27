@@ -1,0 +1,295 @@
+"""
+OSPM runtime staging for stellar observables.
+
+ROLE
+----
+Load, validate, center, convert, and package the already prepared galaxy
+inputs needed by the OSPM runtime.
+
+This module is NOT Data Prep. It does not create the galaxy's static derived
+products. Those are generated beforehand by the reusable tools under
+OSPM/Data_Prep/.
+
+EXPECTED PREPARED INPUTS
+------------------------
+The galaxy config supplies the active paths for:
+    <Galaxy>_stars.csv
+    <Galaxy>_surface_brightness.csv
+    <Galaxy>_losvd_bins.csv
+
+The consolidated OSPM observational representation is prepared separately as:
+    <Galaxy>_observables.csv
+
+The stellar force/tracer products are also prepared separately as:
+    <Galaxy>_stellar_force_grid.csv
+    <Galaxy>_tracer_density_3d.csv
+
+RESPONSIBILITIES
+----------------
+This module:
+    - reads the stellar catalog;
+    - reads the prepared surface-brightness profile;
+    - reads the prepared kinematic radial bins;
+    - validates their runtime contracts;
+    - centers LOS velocities into the model frame;
+    - converts pc -> m and km/s -> m/s;
+    - packages arrays and metadata for the Julia OSPM backend.
+
+This module does NOT:
+    - choose or construct radial bins;
+    - rebin or deproject surface brightness;
+    - build stellar-force or tracer-density grids;
+    - build LOSVD targets;
+    - apply M/L to construct stellar mass;
+    - construct halo density or gravity;
+    - integrate orbits;
+    - solve orbit weights.
+
+Rule of ownership:
+    if a quantity changes only when the adopted galaxy data/geometry changes,
+    it belongs in Data Prep;
+    if it changes with theta, it belongs in the runtime physics/model solve.
+"""
+import numpy as np
+import pandas as pd
+from ..Physics.OSPM_Physics import pc, kms, make_inclination
+
+def _as_bool_array(x):
+    return np.array([str(v).strip().lower() in {"1", "true", "yes", "y", "t"} for v in x], dtype=bool)
+
+def _load_surface_brightness_profile(path):
+    sb = pd.read_csv(path)
+    required = {"R_inner_pc", "R_outer_pc", "R_pc", "light_frac"}
+    missing = required - set(sb.columns)
+    if missing:
+        raise KeyError(f"Surface brightness profile missing columns: {sorted(missing)}")
+    out = { "R_pc": sb["R_pc"].to_numpy(float),
+        "R_inner_pc": sb["R_inner_pc"].to_numpy(float),
+        "R_outer_pc": sb["R_outer_pc"].to_numpy(float),
+        "light_frac": sb["light_frac"].to_numpy(float),
+        "Sigma": sb["Sigma"].to_numpy(float) if "Sigma" in sb.columns else None,
+        "Sigma_err": sb["Sigma_err"].to_numpy(float) if "Sigma_err" in sb.columns else None}
+    return out
+
+def _load_kinematic_bins(path):
+    kb = pd.read_csv(path)
+    required = {"bin_id", "R_inner_pc", "R_outer_pc", "R_mid_pc", "N_vlos"}
+    missing = required - set(kb.columns)
+    if missing:
+        raise KeyError(f"Kinematic bin file missing columns: {sorted(missing)}")
+    edges = np.r_[kb["R_inner_pc"].to_numpy(float)[0], kb["R_outer_pc"].to_numpy(float)]
+    return { "bin_id": kb["bin_id"].to_numpy(int),
+        "R_inner_pc": kb["R_inner_pc"].to_numpy(float),
+        "R_outer_pc": kb["R_outer_pc"].to_numpy(float),
+        "R_mid_pc": kb["R_mid_pc"].to_numpy(float),
+        "N_vlos": kb["N_vlos"].to_numpy(int),
+        "edges_pc": edges}
+
+def _validate_surface_brightness_profile(surface_brightness_profile):
+    if surface_brightness_profile is None:
+        raise KeyError("OSPM observables require a surface_brightness_profile")
+    if "light_frac" not in surface_brightness_profile:
+        raise KeyError("surface_brightness_profile must include light_frac")
+    for key in ("R_inner_pc", "R_outer_pc"):
+        if key not in surface_brightness_profile:
+            raise KeyError(f"surface_brightness_profile must include {key}")
+    light_frac = np.asarray(surface_brightness_profile["light_frac"], float)
+    if light_frac.ndim != 1:
+        raise ValueError("surface_brightness_profile light_frac must be one-dimensional")
+    if light_frac.size == 0:
+        raise ValueError("surface_brightness_profile light_frac is empty")
+    if not np.all(np.isfinite(light_frac)):
+        raise ValueError("surface_brightness_profile light_frac contains non-finite values")
+    if np.any(light_frac < 0.0):
+        raise ValueError("surface_brightness_profile light_frac contains negative values")
+    if not np.isfinite(light_frac.sum()) or light_frac.sum() <= 0.0:
+        raise ValueError("surface_brightness_profile light_frac must sum to a positive finite value")
+    sb_inner = np.asarray(surface_brightness_profile["R_inner_pc"], float)
+    sb_outer = np.asarray(surface_brightness_profile["R_outer_pc"], float)
+    if not (len(sb_inner) == len(sb_outer) == light_frac.size):
+        raise ValueError("surface_brightness_profile radius arrays must match light_frac length")
+    if not np.all(np.isfinite(sb_inner)) or not np.all(np.isfinite(sb_outer)):
+        raise ValueError("Surface-brightness radial bin edges contain non-finite values")
+    if np.any(sb_outer <= sb_inner):
+        raise ValueError("Surface-brightness bins must have R_outer_pc > R_inner_pc")
+    if len(sb_inner) > 1 and np.any(sb_inner[1:] < sb_outer[:-1] - 1e-6):
+        raise ValueError("Surface-brightness bins must be ordered and non-overlapping")
+    return None
+
+def _validate_kinematic_bins(kinematic_bins):
+    if kinematic_bins is None:
+        raise KeyError("OSPM observables require KINEMATIC_BINS_CSV; no adaptive radial-bin fallback is allowed")
+    if "R_mid_pc" not in kinematic_bins:
+        raise KeyError("kinematic_bins must include R_mid_pc")
+    if "N_vlos" not in kinematic_bins:
+        raise KeyError("kinematic_bins must include N_vlos")
+    for key in ("R_inner_pc", "R_outer_pc"):
+        if key not in kinematic_bins:
+            raise KeyError(f"kinematic_bins must include {key}")
+    kb_inner = np.asarray(kinematic_bins["R_inner_pc"], float)
+    kb_outer = np.asarray(kinematic_bins["R_outer_pc"], float)
+    kb_mid = np.asarray(kinematic_bins["R_mid_pc"], float)
+    n_vlos = np.asarray(kinematic_bins["N_vlos"], int)
+    if not (len(kb_inner) == len(kb_outer) == len(kb_mid) == len(n_vlos)):
+        raise ValueError("Kinematic bin arrays must have matching lengths")
+    if not np.all(np.isfinite(kb_inner)) or not np.all(np.isfinite(kb_outer)):
+        raise ValueError("Kinematic radial bin edges contain non-finite values")
+    if not np.all(np.isfinite(kb_mid)):
+        raise ValueError("Kinematic R_mid_pc contains non-finite values")
+    if np.any(kb_outer <= kb_inner):
+        raise ValueError("Kinematic bins must have R_outer_pc > R_inner_pc")
+    if len(kb_inner) > 1 and np.any(kb_inner[1:] < kb_outer[:-1] - 1e-6):
+        raise ValueError("Kinematic bins must be ordered and non-overlapping")
+    if np.any(n_vlos < 0):
+        raise ValueError("Kinematic bins must have non-negative N_vlos")
+    return None
+
+def _validate_surface_brightness_against_kinematic_bins(surface_brightness_profile, kinematic_bins):
+    _validate_surface_brightness_profile(surface_brightness_profile)
+    _validate_kinematic_bins(kinematic_bins)
+    return None
+
+def _stellar_geometry_group(geometry):
+    geom = str(geometry).strip().lower()
+    spherical_geometries = { "spherical_shell_grid", "spherical_abel_grid", "spherical_enclosed_light_grid", "spherical_force_flattened_grid_metadata" }
+    if geom in spherical_geometries:
+        return "spherical"
+    if geom == "axisymmetric_density_grid":
+        return "axisymmetric"
+    raise ValueError(f"Unknown light_grid geometry: {geom}")
+
+def _validate_stellar_model_geometry(stellar_model):
+    if stellar_model is None:
+        return None
+    if "type" not in stellar_model:
+        raise KeyError("STELLAR_MODEL must include type")
+    stype = str(stellar_model["type"]).strip().lower()
+    geometry = str(stellar_model.get("geometry", "spherical_shell_grid")).strip().lower()
+    if stype == "light_grid":
+        group = _stellar_geometry_group(geometry)
+        if group == "spherical":
+            required = {"grid_csv", "Ltot", "radius_col", "theta_col", "nu_col", "lenc_frac_col"}
+        elif group == "axisymmetric":
+            required = { "grid_csv", "Ltot", "R_cyl_col", "z_col", "nu_col", "volume_col", "luminosity_col", "q_axis_ratio"}
+        else:
+            raise ValueError(f"Unknown light_grid geometry group: {group}")
+        missing = required - set(stellar_model.keys())
+        if missing:
+            raise KeyError(f"light_grid STELLAR_MODEL missing keys for geometry={geometry}: {sorted(missing)}")
+    return None
+
+def _config_first(config, *keys, default=None):
+    if config is None:
+        return default
+    for key in keys:
+        if key in config and config[key] is not None:
+            return config[key]
+    return default
+
+def _apply_motion_model(df, *, v_col, config=None):
+    """Return velocities in the model frame.
+    OSPM orbit velocities are internal velocities centered near zero.
+    Observed catalog vlos values are usually heliocentric.  For pressure-supported
+    systems such as Draco, subtracting V_SYS_KMS is a frame centering operation,
+    not a rotating/streaming motion model.
+    """
+    v_raw = np.asarray(df[v_col].values, float)
+    v_model = np.zeros_like(v_raw, dtype=float)
+    if config is None:
+        return v_raw, v_raw, v_model
+    # Preferred simple contract for dwarf pressure-supported systems.
+    # Example:
+    #     "V_SYS_KMS": -291.68214888089926
+    v_sys = _config_first(config, "V_SYS_KMS", "SYSTEMIC_VELOCITY_KMS", "VLOS_SYSTEMIC_KMS", default=None)
+    if v_sys is not None:
+        v_model = np.full_like(v_raw, float(v_sys), dtype=float)
+        return v_raw - v_model, v_raw, v_model
+    dyn_mode = config.get("DYNAMICAL_MODE", "pressure_supported")
+    if dyn_mode in ("pressure_supported", "spherical_pressure_supported"):
+        return v_raw, v_raw, v_model
+    if dyn_mode != "non_pressure_supported":
+        raise ValueError(f"Unknown DYNAMICAL_MODE: {dyn_mode}")
+    motion = config.get("MOTION_MODEL", None)
+    if motion is None:
+        raise KeyError("DYNAMICAL_MODE='non_pressure_supported' requires MOTION_MODEL")
+    if motion.get("mode") == "systemic":
+        raw_v_col = motion.get("raw_v_col", v_col)
+        v_raw = np.asarray(df[raw_v_col].values, float)
+        v_model = np.full_like(v_raw, float(motion["v_sys_kms"]), dtype=float)
+        return v_raw - v_model, v_raw, v_model
+    raise ValueError(f"Unknown MOTION_MODEL mode: {motion.get('mode')}")
+
+class OSPMObservablesStellar:
+    def __init__(self, *, R_star_pc, v_star_kms, verr_star_kms, has_vlos, inclination_deg, Norbit, stellar_model=None,
+                 surface_brightness_profile=None, kinematic_bins=None, dynamical_mode=None, motion_model=None, v_star_raw_kms=None, v_motion_model_kms=None):
+        self.mode = "ospm"
+        self.dynamical_mode = dynamical_mode
+        self.motion_model = motion_model
+        self.stellar_model = stellar_model
+        self.surface_brightness_profile = surface_brightness_profile
+        self.kinematic_bins = kinematic_bins
+        self.light_bin_edges_pc = None if surface_brightness_profile is None else np.r_[surface_brightness_profile["R_inner_pc"][0], surface_brightness_profile["R_outer_pc"]]
+        self.kinematic_bin_edges_pc = None if kinematic_bins is None else kinematic_bins["edges_pc"]
+        self.N_light = 0 if surface_brightness_profile is None else int(len(surface_brightness_profile["light_frac"]))
+        self.N_kin = 0 if kinematic_bins is None else int(len(kinematic_bins["R_mid_pc"]))
+        _validate_stellar_model_geometry(self.stellar_model)
+        _validate_surface_brightness_against_kinematic_bins(self.surface_brightness_profile, self.kinematic_bins)
+        R = np.asarray(R_star_pc, float)
+        v = np.asarray(v_star_kms, float)
+        ve = np.asarray(verr_star_kms, float)
+        hv = np.asarray(has_vlos, bool)
+        if not (len(R) == len(v) == len(ve) == len(hv)):
+            raise ValueError("Star arrays must have equal length")
+        geom = np.isfinite(R) & (R > 0)
+        if not np.any(geom):
+            raise RuntimeError("No valid stars after geometric filtering")
+        self.R_star_pc = R[geom]
+        self.v_star_kms = v[geom]
+        self.verr_star_kms = ve[geom]
+        self.has_vlos = hv[geom]
+        self.valid_vlos = self.has_vlos & np.isfinite(self.v_star_kms) & np.isfinite(self.verr_star_kms) & (self.verr_star_kms > 0)
+        if not np.any(self.valid_vlos):
+            raise RuntimeError("No valid vlos stars after filtering")
+        self.R_star_m = self.R_star_pc * pc
+        self.v_star_mps = self.v_star_kms * kms
+        self.verr_star_mps = self.verr_star_kms * kms
+        self.v_star_raw_kms = None if v_star_raw_kms is None else np.asarray(v_star_raw_kms, float)[geom]
+        self.v_motion_model_kms = None if v_motion_model_kms is None else np.asarray(v_motion_model_kms, float)[geom]
+        good_v = self.has_vlos & np.isfinite(self.v_star_kms)
+        self.v_star_kms_median = float(np.nanmedian(self.v_star_kms[good_v])) if np.any(good_v) else np.nan
+        self.v_star_kms_mean = float(np.nanmean(self.v_star_kms[good_v])) if np.any(good_v) else np.nan
+        self.v_star_kms_std = float(np.nanstd(self.v_star_kms[good_v])) if np.any(good_v) else np.nan
+        self.sini, self.cosi, self.edge_on = make_inclination(inclination_deg)
+        self.Norbit = int(Norbit)
+        self.Nstar = len(self.R_star_m)
+        self.Nstar_vlos = int(self.valid_vlos.sum())
+
+    @classmethod
+    def from_star_table(cls, csv_path, *, r_col="r_pc", v_col="vlos", verr_col="vlos_err", has_vlos_col="has_vlos", inclination_deg,
+                        Norbit, stellar_model=None, surface_brightness_path=None, kinematic_bins_path=None, config=None):
+        df = pd.read_csv(csv_path)
+        needed = [r_col, v_col, verr_col]
+        missing = [c for c in needed if c not in df.columns]
+        if missing:
+            raise KeyError(f"Missing required columns in star table: {missing}")
+        if has_vlos_col in df.columns:
+            has_vlos = _as_bool_array(df[has_vlos_col].values)
+        else:
+            has_vlos = np.isfinite(df[v_col].to_numpy(float)) & np.isfinite(df[verr_col].to_numpy(float))
+        if surface_brightness_path is None and config is not None:
+            surface_brightness_path = config.get("SURFACE_BRIGHTNESS_CSV")
+        if surface_brightness_path is None:
+            raise KeyError("OSPM observables require SURFACE_BRIGHTNESS_CSV")
+        if kinematic_bins_path is None and config is not None:
+            kinematic_bins_path = config.get("KINEMATIC_BINS_CSV")
+        if kinematic_bins_path is None:
+            raise KeyError("OSPM observables require KINEMATIC_BINS_CSV")
+        surface_brightness_profile = _load_surface_brightness_profile(surface_brightness_path)
+        kinematic_bins = _load_kinematic_bins(kinematic_bins_path)
+        _validate_surface_brightness_against_kinematic_bins(surface_brightness_profile, kinematic_bins)
+        _validate_stellar_model_geometry(stellar_model)
+        v_used, v_raw, v_model = _apply_motion_model(df, v_col=v_col, config=config)
+        return cls(R_star_pc=df[r_col].values, v_star_kms=v_used, verr_star_kms=df[verr_col].values, has_vlos=has_vlos,
+                   inclination_deg=inclination_deg, Norbit=Norbit, stellar_model=stellar_model, surface_brightness_profile=surface_brightness_profile,
+                   kinematic_bins=kinematic_bins, dynamical_mode=None if config is None else config.get("DYNAMICAL_MODE"),
+                   motion_model=None if config is None else config.get("MOTION_MODEL"), v_star_raw_kms=v_raw, v_motion_model_kms=v_model)
